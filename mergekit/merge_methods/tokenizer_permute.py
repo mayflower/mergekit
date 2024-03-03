@@ -79,7 +79,7 @@ class TokenizerPermutationMergeTask(Task[torch.Tensor]):
             if self.use_slerp:
                 weight = (1.0 - self.slerp_t) if is_base else self.slerp_t
             else:
-                weight = self.tensor_parameters[model]["weight"]
+                weight = self.tensor_parameters[model]["weight"] or 1.0
 
             weights.append(weight)
 
