@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -31,7 +32,9 @@ class LoaderCache:
             merged = model.merged(
                 cache_dir=self.lora_cache_dir, trust_remote_code=self.trust_remote_code
             )
-            self.loaders[model] = merged.lazy_loader(cache_dir=self.hf_cache_dir)
+            self.loaders[model] = merged.lazy_loader(
+                cache_dir=self.hf_cache_dir, lazy_unpickle=self.lazy_unpickle
+            )
         return self.loaders[model]
 
     def flush_all(self):
@@ -45,9 +48,16 @@ class LoaderCache:
         self.trust_remote_code = options.trust_remote_code
 
 
+shard_name_re = re.compile(r"model\-([0-9]+)-of-([0-9]+)")
+
+
 def _normalized_shard_name(path: str) -> int:
     name, _ext = os.path.splitext(os.path.basename(path))
-    return name.lower().replace("pytorch_model", "model")
+    name = name.lower().replace("pytorch_model", "model")
+    if m := shard_name_re.search(name):
+        frac = int(m.group(1)) / int(m.group(2))
+        name = f"model-{int(frac*100):03d}pct"
+    return name
 
 
 class LoadTensor(Task[Optional[torch.Tensor]]):
@@ -79,8 +89,8 @@ class LoadTensor(Task[Optional[torch.Tensor]]):
             return None
 
         x = loader.get_tensor(name, device=self.device or "cpu")
-        if self.dtype:
-            x = x.to(dtype=dtype_from_name(self.dtype))
+        if self.dtype and (dtype := dtype_from_name(self.dtype)) != x.dtype:
+            x = x.to(dtype=dtype)
         return x
 
     def priority(self) -> int:
@@ -89,10 +99,11 @@ class LoadTensor(Task[Optional[torch.Tensor]]):
     def group_label(self) -> Optional[str]:
         loader = LoaderCache().get(self.model)
         name = self._resolve_name(loader)
-        if name:
-            shard_path = loader.index.tensor_paths[name]
-            return _normalized_shard_name(shard_path)
-        return None
+        # if name:
+        #     shard_path = loader.index.tensor_paths[name]
+        #     return _normalized_shard_name(shard_path)
+        # return None
+        return name
 
 
 class GatherTensors(Task[Dict[ModelReference, torch.Tensor]]):
@@ -105,7 +116,7 @@ class GatherTensors(Task[Dict[ModelReference, torch.Tensor]]):
             f"{str(model)}:{wi.name}": LoadTensor(
                 model=model,
                 tensor=wi.name,
-                dtype=self.dtype,
+                dtype=wi.force_dtype or self.dtype,
                 device=self.device,
                 optional=wi.optional,
                 aliases=wi.aliases,
@@ -150,6 +161,7 @@ class SaveTensor(Task[None]):
     writer_task: TensorWriterTask
     clone: bool
     optional: bool = False
+    dtype: Optional[str] = None
 
     def arguments(self) -> Dict[str, Task]:
         return {"writer": self.writer_task, "tensor": self.tensor_task}
@@ -165,6 +177,8 @@ class SaveTensor(Task[None]):
             if not self.optional:
                 raise RuntimeError(f"No value for required tensor {self.tensor_name}")
             return
+        if self.dtype:
+            tensor = tensor.to(dtype=dtype_from_name(self.dtype))
         writer.save_tensor(name=self.tensor_name, tensor=tensor, clone=self.clone)
 
 
@@ -180,3 +194,30 @@ class FinalizeModel(Task[None]):
 
     def execute(self, writer: TensorWriter, **kwargs) -> None:
         writer.finalize()
+
+
+class BuildStateDict(Task[Dict[str, torch.Tensor]]):
+    tensors: ImmutableMap[WeightInfo, Task[torch.Tensor]]
+
+    def arguments(self) -> Dict[str, Task]:
+        return {str(wi): t for wi, t in self.tensors.items()}
+
+    def execute(self, **kwargs) -> Dict[str, torch.Tensor]:
+        return {str(wi): t for wi, t in self.tensors.items()}
+
+
+class ReturnTensor(Task[torch.Tensor]):
+    weight_info: WeightInfo
+    tensor_task: Task[torch.Tensor]
+
+    def arguments(self) -> Dict[str, Task]:
+        return {"tensor": self.tensor_task}
+
+    def priority(self) -> int:
+        return 10000
+
+    def group_label(self) -> Optional[str]:
+        return self.tensor_task.group_label()
+
+    def execute(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor

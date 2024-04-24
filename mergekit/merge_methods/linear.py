@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see http://www.gnu.org/licenses/.
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -59,9 +59,12 @@ class LinearMergeTask(Task[torch.Tensor]):
 
         res = (weights * tensors).sum(dim=0)
         if self.normalize:
-            res /= weights.sum(dim=0)
+            res = res / weights.sum(dim=0)
 
         return res
+
+    def group_label(self) -> Optional[str]:
+        return self.gather_tensors.group_label()
 
 
 class LinearMerge(MergeMethod):
